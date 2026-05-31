@@ -22,6 +22,58 @@ from lavis.models.blip2_models.blip2 import (
 from lavis.models.blip_models.blip_outputs import BlipOutput, BlipOutputFeatures
 
 
+class MultiTurnAttentionBlock(nn.Module):
+    """
+    Multi-turn cross-attention block (decoder-style).
+
+    Inputs:
+        current_feedback_embeddings: (B, Lq, D) queries (current turn)
+        conversation_history_buffer: (B, Lh, D) keys/values (previous turns)
+    Output:
+        (B, Lq, D) attended + refined current embeddings
+    """
+
+    def __init__(self, hidden_size: int, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ln1 = nn.LayerNorm(hidden_size)
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 4, hidden_size),
+        )
+        self.ln2 = nn.LayerNorm(hidden_size)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        current_feedback_embeddings: torch.Tensor,
+        conversation_history_buffer: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if conversation_history_buffer is None or conversation_history_buffer.size(1) == 0:
+            return current_feedback_embeddings
+
+        attn_out, _ = self.cross_attn(
+            query=current_feedback_embeddings,
+            key=conversation_history_buffer,
+            value=conversation_history_buffer,
+            need_weights=False,
+        )
+        x = self.ln1(current_feedback_embeddings + self.dropout1(attn_out))
+        ffn_out = self.ffn(x)
+        x = self.ln2(x + self.dropout2(ffn_out))
+        return x
+
+
 @registry.register_model("blip2_cir_align_prompt")
 class Blip2QformerCirAlignPrompt(Blip2Base):
     """
@@ -91,6 +143,90 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         )
         self.prompt_tokens.data.normal_(mean=0.0, std=self.Qformer.config.initializer_range)
 
+        # multi-turn attention-based prompt generator (conversation memory)
+        hidden_size = self.Qformer.config.hidden_size
+        self.use_conversation_memory = True
+        self.history_max_turns = 8  # sliding window for conversation history
+        self.multi_turn_attn = MultiTurnAttentionBlock(
+            hidden_size=hidden_size, num_heads=8, dropout=0.1
+        )
+        self.context_proj = nn.Linear(hidden_size, hidden_size)
+        self._history_buffer = None  # (B, T, D) of past turn embeddings
+        # start as a no-op; model can learn to turn memory on gradually
+        self.memory_scale = nn.Parameter(torch.zeros(1))
+
+    def reset_memory(self, batch_size: int = None, device: torch.device = None):
+        """
+        Reset conversation memory/history buffer.
+        """
+        self._history_buffer = None
+        if batch_size is not None:
+            if device is None:
+                device = self.device
+            self._history_buffer = torch.zeros(
+                batch_size,
+                0,
+                self.Qformer.config.hidden_size,
+                device=device,
+            )
+
+    def _apply_memory_to_queries(self, query_tokens: torch.Tensor, feedback_embedding: torch.Tensor) -> torch.Tensor:
+        """
+        Attend current feedback to conversation history and inject refined context into query tokens
+        before they enter the Q-Former.
+        query_tokens: (B, num_query, D)
+        feedback_embedding: (B, D)
+        """
+        if not self.use_conversation_memory:
+            return query_tokens
+
+        # lazy init history buffer if missing/mismatched batch
+        if self._history_buffer is None or self._history_buffer.size(0) != feedback_embedding.size(0):
+            self._history_buffer = torch.zeros(
+                feedback_embedding.size(0),
+                0,
+                feedback_embedding.size(-1),
+                device=feedback_embedding.device,
+                dtype=feedback_embedding.dtype,
+            )
+
+        # query is current turn embedding (B, 1, D); keys/values are past turns (B, T, D)
+        # Detach history so we don't backprop through all previous turns (prevents VRAM blowup).
+        q = feedback_embedding.unsqueeze(1)
+        history = self._history_buffer.detach()
+        attended = self.multi_turn_attn(q, history)  # (B, 1, D)
+        context = self.context_proj(attended)  # (B, 1, D)
+
+        # update sliding-window history with current turn embedding (detached to stop graph growth)
+        self._history_buffer = torch.cat([self._history_buffer, q.detach()], dim=1)
+        if self._history_buffer.size(1) > self.history_max_turns:
+            self._history_buffer = self._history_buffer[:, -self.history_max_turns :, :]
+
+        return query_tokens + self.memory_scale * context
+
+    def _encode_feedback(self, raw_texts, device):
+        """
+        Encode raw feedback texts into a feedback embedding suitable for the memory GRU.
+        Returns:
+            feedback_embedding: (B, D)
+            text_tokens: tokenized batch (for re-use in fusion)
+        """
+        text_tokens = self.tokenizer(
+            raw_texts,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_txt_len,
+            return_tensors="pt",
+        ).to(device)
+
+        text_only_output = self.Qformer.bert(
+            text_tokens.input_ids,
+            attention_mask=text_tokens.attention_mask,
+            return_dict=True,
+        )
+        feedback_embedding = text_only_output.last_hidden_state[:, 0, :]
+        return feedback_embedding, text_tokens
+
 
     def forward(self, samples):
         image = samples["image"]
@@ -108,38 +244,81 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(
             self.device
         )
-        # text tokens
-        text_tokens = self.tokenizer(
-            text,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_txt_len,
-            return_tensors="pt",
-        ).to(image.device)
-        # fusion reference image and text tokens into a set of multi-modal tokens
-        attention_mask = torch.cat([query_atts, text_tokens.attention_mask], dim=1)
-        fusion_output = self.Qformer.bert(
-            text_tokens.input_ids,
-            query_embeds=query_tokens,
-            attention_mask=attention_mask,
-            encoder_hidden_states=image_embeds,
-            encoder_attention_mask=image_atts,
-            return_dict=True,
-        )
 
-        text_output = self.Qformer.bert(
-            text_tokens.input_ids,
-            query_embeds=fusion_output.last_hidden_state[:, : query_tokens.size(1), :],
-            attention_mask=attention_mask,
-            return_dict=True,
+        # detect whether we have multi-turn feedback: List[List[str]] vs List[str]
+        is_multi_turn = (
+            isinstance(text, (list, tuple))
+            and len(text) > 0
+            and isinstance(text[0], (list, tuple))
         )
+        if is_multi_turn:
+            # initialize memory for this batch if needed
+            if self._history_buffer is None or self._history_buffer.size(0) != image_embeds.size(0):
+                self.reset_memory(batch_size=image_embeds.size(0), device=image.device)
 
-        fusion_feats = F.normalize(
-            self.text_proj(text_output.last_hidden_state[:, 32, :]), dim=-1
-        )
+            num_turns = max(len(t) for t in text)
+            fusion_feats = None
+            text_tokens = None
+            for turn_idx in range(num_turns):
+                # collect current turn texts (fallback to last available if lengths differ)
+                turn_texts = [
+                    (t[turn_idx] if turn_idx < len(t) else t[-1])
+                    for t in text
+                ]
+                feedback_embedding, text_tokens = self._encode_feedback(turn_texts, image.device)
 
+                # update query tokens with conversation memory
+                query_tokens_turn = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
+                query_tokens_turn = self._apply_memory_to_queries(query_tokens_turn, feedback_embedding)
+
+                attention_mask = torch.cat([query_atts, text_tokens.attention_mask], dim=1)
+                fusion_output = self.Qformer.bert(
+                    text_tokens.input_ids,
+                    query_embeds=query_tokens_turn,
+                    attention_mask=attention_mask,
+                    encoder_hidden_states=image_embeds,
+                    encoder_attention_mask=image_atts,
+                    return_dict=True,
+                )
+
+                text_output = self.Qformer.bert(
+                    text_tokens.input_ids,
+                    query_embeds=fusion_output.last_hidden_state[:, : query_tokens_turn.size(1), :],
+                    attention_mask=attention_mask,
+                    return_dict=True,
+                )
+
+                fusion_feats = F.normalize(
+                    self.text_proj(text_output.last_hidden_state[:, 32, :]), dim=-1
+                )
+        else:
+            # single-turn feedback (original behaviour, augmented with memory)
+            feedback_embedding, text_tokens = self._encode_feedback(text, image.device)
+            query_tokens = self._apply_memory_to_queries(query_tokens, feedback_embedding)
+
+            attention_mask = torch.cat([query_atts, text_tokens.attention_mask], dim=1)
+            fusion_output = self.Qformer.bert(
+                text_tokens.input_ids,
+                query_embeds=query_tokens,
+                attention_mask=attention_mask,
+                encoder_hidden_states=image_embeds,
+                encoder_attention_mask=image_atts,
+                return_dict=True,
+            )
+
+            text_output = self.Qformer.bert(
+                text_tokens.input_ids,
+                query_embeds=fusion_output.last_hidden_state[:, : query_tokens.size(1), :],
+                attention_mask=attention_mask,
+                return_dict=True,
+            )
+
+            fusion_feats = F.normalize(
+                self.text_proj(text_output.last_hidden_state[:, 32, :]), dim=-1
+            )
+        
         ###============== Fusion-target Contrastive ===================###
-        # reference image feature  
+        # target image feature  
         taregt_embeds = self.ln_vision(self.visual_encoder(target))
         target_atts = torch.ones(taregt_embeds.size()[:-1], dtype=torch.long).to(
             image.device
@@ -162,12 +341,10 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         sim_i2t, _ = sim_t2q.max(-1)
         sim_i2t = sim_i2t / self.temp
         bs = image.size(0)
-        targets = torch.linspace(0,  bs - 1, bs, dtype=int).to(
-            image.device
-        )
+        targets = torch.arange(bs, device=image.device, dtype=torch.long)
         loss_itc = F.cross_entropy(sim_i2t, targets)
 
-         ###============== Relative Contrastive ===================###
+        ###============== Relative Contrastive ===================###
         prompt_tokens = self.prompt_tokens.expand(image_embeds.shape[0], -1, -1)
 
         text_only_output = self.Qformer.bert(
@@ -319,14 +496,9 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(
             self.device
         )
-        # text tokens
-        text_tokens = self.tokenizer(
-            text,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_txt_len,
-            return_tensors="pt",
-        ).to(reference_embeds.device)
+        # text tokens and feedback embedding (update memory across calls)
+        feedback_embedding, text_tokens = self._encode_feedback(text, reference_embeds.device)
+        query_tokens = self._apply_memory_to_queries(query_tokens, feedback_embedding)
 
         attention_mask = torch.cat([query_atts, text_tokens.attention_mask], dim=1)
         fusion_output = self.Qformer.bert(
@@ -507,7 +679,8 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         cross_attention_freq = cfg.get("cross_attention_freq", 2)
 
         drop_path_rate = cfg.get("drop_path_rate", 0)
-        use_grad_checkpoint = cfg.get("use_grad_checkpoint", False)
+        # enable gradient checkpointing by default for Q-Former to reduce memory
+        use_grad_checkpoint = cfg.get("use_grad_checkpoint", True)
         vit_precision = cfg.get("vit_precision", "fp16")
         freeze_vit = cfg.get("freeze_vit", True)
 

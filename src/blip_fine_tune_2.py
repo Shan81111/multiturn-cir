@@ -22,6 +22,58 @@ from utils import collate_fn, update_train_running_results,update_train_running_
 from validate_blip import compute_cirr_val_metrics, compute_fiq_val_metrics
 
 
+def _make_adamw_param_groups(
+    model: nn.Module,
+    base_lr: float,
+    memory_lr_mult: float = 5.0,
+    weight_decay: float = 0.05,
+):
+    """
+    AdamW param groups with:
+    - separate LR for multi-turn attention memory module
+    - no weight decay on bias / norm parameters (more stable)
+    """
+
+    def is_no_decay(n: str) -> bool:
+        n = n.lower()
+        return (
+            n.endswith("bias")
+            or "layernorm" in n
+            or ".ln" in n
+            or "norm" in n
+        )
+
+    memory_prefixes = ("multi_turn_attn.", "context_proj.")
+    memory_exact = {"memory_scale", "prompt_tokens"}
+
+    base_decay, base_no_decay = [], []
+    mem_decay, mem_no_decay = [], []
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+
+        is_memory = name.startswith(memory_prefixes) or name in memory_exact
+        bucket = (mem_no_decay if is_no_decay(name) else mem_decay) if is_memory else (
+            base_no_decay if is_no_decay(name) else base_decay
+        )
+        bucket.append(p)
+
+    mem_lr = base_lr * float(memory_lr_mult)
+
+    param_groups = []
+    if base_decay:
+        param_groups.append({"params": base_decay, "lr": base_lr, "weight_decay": weight_decay})
+    if base_no_decay:
+        param_groups.append({"params": base_no_decay, "lr": base_lr, "weight_decay": 0.0})
+    if mem_decay:
+        param_groups.append({"params": mem_decay, "lr": mem_lr, "weight_decay": weight_decay})
+    if mem_no_decay:
+        param_groups.append({"params": mem_no_decay, "lr": mem_lr, "weight_decay": 0.0})
+
+    return param_groups
+
+
 def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
                       num_epochs: int, blip_model_name: str, backbone: str, learning_rate: float, batch_size: int,
                       validation_frequency: int, transform: str, save_training: bool, save_best: bool, save_memory: bool, 
@@ -86,15 +138,19 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
                                        num_workers=kwargs['num_workers'], pin_memory=False, collate_fn=collate_fn,
                                        drop_last=True, shuffle=True)
 
-    # Define the optimizer, the loss and the grad scaler
-    optimizer = optim.AdamW(
-        [{'params': filter(lambda p: p.requires_grad, blip_model.parameters()), 'lr': learning_rate,
-        #   'betas': (0.9, 0.999), 'eps': 1e-7, 'weight_decay':0.05}])
-        'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay':0.05}])
+    memory_lr_mult = kwargs.get("memory_lr_mult", 5.0)
+    weight_decay = kwargs.get("weight_decay", 0.05)
+    param_groups = _make_adamw_param_groups(
+        blip_model,
+        base_lr=learning_rate,
+        memory_lr_mult=memory_lr_mult,
+        weight_decay=weight_decay,
+    )
+    optimizer = optim.AdamW(param_groups, betas=(0.9, 0.98), eps=1e-7)
     # scheduler = OneCycleLR(optimizer, max_lr=learning_rate, pct_start=1/50, steps_per_epoch=len(relative_train_loader), epochs=80)
     scheduler = OneCycleLR(optimizer, max_lr=learning_rate, pct_start=1.5/num_epochs, div_factor=100., steps_per_epoch=len(relative_train_loader), epochs=num_epochs)
 
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
 
     # When save_best == True initialize the best result to zero
     if save_best:
@@ -104,6 +160,14 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
     training_log_frame = pd.DataFrame()
     validation_log_frame = pd.DataFrame()
 
+
+    multi_turn = kwargs.get("multi_turn", False)
+
+    # If the model has a gated memory, keep it fixed (off) for a few epochs,
+    # then allow it to learn so early training stays close to baseline.
+    if hasattr(blip_model, "memory_scale"):
+        blip_model.memory_scale.data.zero_()
+        blip_model.memory_scale.requires_grad = False
 
     # Start with the training loop
     print('Training loop started')
@@ -119,20 +183,37 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
             reference_images = reference_images.to(device, non_blocking=True)
             target_images = target_images.to(device, non_blocking=True)
 
-            # Randomize the training caption in four way: (a) cap1 and cap2 (b) cap2 and cap1 (c) cap1 (d) cap2
-            flattened_captions: list = np.array(captions).T.flatten().tolist()
-            captions = generate_randomized_fiq_caption(flattened_captions)
-            captions = [txt_processors["eval"](caption) for caption in captions]
+            # Prepare captions: either single-turn (original behaviour) or multi-turn sequence
+            if multi_turn:
+                # FashionIQ returns two captions per example; DataLoader batches them as
+                # captions shape roughly (2, B). We want (B, 2) -> list of turns per sample.
+                captions_array = np.array(captions).T  # (B, 2) regardless of original ordering
+                processed_captions = []
+                for cap_pair in captions_array:
+                    turns = [txt_processors["eval"](c) for c in cap_pair]
+                    processed_captions.append(turns)
+            else:
+                # Randomize the training caption in four way: (a) cap1 and cap2 (b) cap2 and cap1 (c) cap1 (d) cap2
+                flattened_captions: list = np.array(captions).T.flatten().tolist()
+                randomized = generate_randomized_fiq_caption(flattened_captions)
+                processed_captions = [txt_processors["eval"](caption) for caption in randomized]
+
             blip_model.train()
+            # reset conversation memory at the beginning of each new triplet sequence if supported
+            if hasattr(blip_model, "reset_memory") and multi_turn:
+                blip_model.reset_memory(batch_size=reference_images.size(0), device=device)
+
             # Extract the features, compute the logits and the loss
-            with torch.cuda.amp.autocast():
-                loss_dict = blip_model({"image":reference_images, "target":target_images, "text_input":captions})
+            with torch.amp.autocast('cuda'):
+                loss_dict = blip_model({"image":reference_images, "target":target_images, "text_input":processed_captions})
                 loss = 0.
                 for key in loss_dict.keys():
                     loss += loss_dict[key]
 
             # Backpropagate and update the weights
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(blip_model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -190,6 +271,10 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
                 if save_best and results_dict['average_recall'] > best_avg_recall:
                     best_avg_recall = results_dict['average_recall']
                     save_model('tuned_clip_best', epoch, blip_model, training_path)
+
+        # after a warmup period, allow memory_scale to start learning
+        if epoch == 2 and hasattr(blip_model, "memory_scale"):
+            blip_model.memory_scale.requires_grad = True
 
 
 
@@ -253,13 +338,18 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
                                        num_workers=kwargs['num_workers'], pin_memory=False, collate_fn=collate_fn,
                                        drop_last=True, shuffle=True)
 
-    # Define the optimizer, the loss and the grad scaler
-    optimizer = optim.AdamW(
-        [{'params': filter(lambda p: p.requires_grad, blip_model.parameters()), 'lr': learning_rate,
-          'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay':0.05}])
+    memory_lr_mult = kwargs.get("memory_lr_mult", 5.0)
+    weight_decay = kwargs.get("weight_decay", 0.05)
+    param_groups = _make_adamw_param_groups(
+        blip_model,
+        base_lr=learning_rate,
+        memory_lr_mult=memory_lr_mult,
+        weight_decay=weight_decay,
+    )
+    optimizer = optim.AdamW(param_groups, betas=(0.9, 0.98), eps=1e-7)
     scheduler = OneCycleLR(optimizer, max_lr=learning_rate, pct_start=1/50, steps_per_epoch=len(relative_train_loader), epochs=80)
 
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
 
     # When save_best == True initialize the best results to zero
     if save_best:
@@ -275,6 +365,8 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
     # # 
     # results = compute_cirr_val_metrics(relative_val_dataset, blip_model, val_index_features,
     #                                     val_index_names, txt_processors)
+    multi_turn = kwargs.get("multi_turn", False)
+
     for epoch in range(num_epochs):
         train_running_results = {'images_in_epoch': 0}
         train_bar = tqdm(relative_train_loader, ncols=150)
@@ -286,11 +378,20 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
 
             reference_images = reference_images.to(device, non_blocking=True)
             target_images = target_images.to(device, non_blocking=True)
-            captions = [txt_processors["eval"](caption) for caption in captions]
+
+            if multi_turn:
+                # wrap each caption as a single-turn sequence to reuse multi-turn capable models
+                processed_captions = [[txt_processors["eval"](caption)] for caption in captions]
+            else:
+                processed_captions = [txt_processors["eval"](caption) for caption in captions]
+
             blip_model.train()
+            # reset memory per conversational sequence if supported
+            if hasattr(blip_model, "reset_memory") and multi_turn:
+                blip_model.reset_memory(batch_size=reference_images.size(0), device=device)
             # Extract the features, compute the logits and the loss
-            with torch.cuda.amp.autocast():
-                loss_dict = blip_model({"image":reference_images, "target":target_images, "text_input":captions})
+            with torch.amp.autocast('cuda'):
+                loss_dict = blip_model({"image":reference_images, "target":target_images, "text_input":processed_captions})
                 loss = 0.
                 for key in loss_dict.keys():
                     if key != 'loss_itc':
@@ -299,6 +400,8 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
                         loss += loss_dict[key]
             # Backpropagate and update the weights
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(blip_model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -389,6 +492,12 @@ if __name__ == '__main__':
                         help="Save only the best model during training")
     parser.add_argument("--save-memory", dest="save_memory", action='store_true',
                         help="Save only the best model during training")
+    parser.add_argument("--multi-turn", dest="multi_turn", action='store_true',
+                        help="Enable multi-turn caption training (conversational feedback)")
+    parser.add_argument("--memory-lr-mult", dest="memory_lr_mult", default=5.0, type=float,
+                        help="LR multiplier for multi-turn attention memory params")
+    parser.add_argument("--weight-decay", dest="weight_decay", default=0.05, type=float,
+                        help="AdamW weight decay (norm/bias excluded automatically)")
 
     args = parser.parse_args()
     if args.dataset.lower() not in ['fashioniq', 'cirr']:
@@ -410,7 +519,10 @@ if __name__ == '__main__':
         "loss_rtc": args.loss_rtc,
         "loss_align": args.loss_align,
         "loss_itm": args.loss_itm,
-        "save_memory": args.save_memory
+        "save_memory": args.save_memory,
+        "multi_turn": args.multi_turn,
+        "memory_lr_mult": args.memory_lr_mult,
+        "weight_decay": args.weight_decay,
     }
     # set_seed(912)
     if args.dataset.lower() == 'cirr':
@@ -419,5 +531,3 @@ if __name__ == '__main__':
         training_hyper_params.update(
             {'train_dress_types': ['dress', 'toptee', 'shirt'], 'val_dress_types': ['dress', 'toptee', 'shirt']})
         clip_finetune_fiq(**training_hyper_params)
-
-
